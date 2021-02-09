@@ -12,21 +12,29 @@ if not os.path.exists("config.json"):
     open("config.json", "wb").write(json.dumps({
         "server": {
             "host": "0.0.0.0",
-            "port": 8080
+            "port": 8015
         },
         "odbc": {
             "windows": {
-                "url": ""
+                "endpoints": {
+                    "compile": ""
+                }
             },
             "linux": {
-                "url": ""
+                "endpoints": {
+                    "compile": ""
+                }
             }
         },
         "dbpc": {
-            "url": ""
+            "endpoints": {
+                "compile": ""
+            }
         },
         "odb-bot": {
-            "url": ""
+            "endpoints": {
+                "status": ""
+            }
         },
         "github": {
             "url": "https://www.github.com/OpenDarkBASIC/odb-dbp-ci-sources",
@@ -77,34 +85,22 @@ def all_equal(l):
     return all(first == rest for rest in iterator)
 
 
+def iterate_dba_files():
+    for root, subdirs, files in os.walk(srcdir):
+        for f in files:
+            if not f.endswith(".dba"):
+                continue
+            yield os.path.join(root, f), f
+
+
 async def update_and_run_all():
-    s, status = await update_sources()
-    if status != 200:
+    if not await do_update_sources():
         return
-    await run_all()
+    await do_run_all()
+    await do_status()
 
 
-@app.route("/github", methods=["POST"])
-async def github_event():
-    payload = await quart.request.get_data()
-    if not verify_signature(payload, quart.request.headers["X-Hub-Signature-256"].replace("sha256=", ""), config["github"]["secret"]):
-        quart.abort(403)
-
-    event_type = quart.request.headers["X-GitHub-Event"]
-    if not event_type == "push":
-        return "", 200
-
-    # only care about pushes to master branch
-    data = json.loads(payload.decode("utf-8"))
-    if not data["ref"].rsplit("/", 1)[-1] == "master":
-        return ""
-
-    asyncio.ensure_future(update_and_run_all())
-    return "", 200
-
-
-@app.route("/update_sources")
-async def update_sources():
+async def do_update_sources():
     async with lock:
         if not os.path.exists(srcdir):
             git_process = await asyncio.create_subprocess_exec("git", "clone", config["github"]["url"], srcdir)
@@ -113,33 +109,32 @@ async def update_sources():
             git_process = await asyncio.create_subprocess_exec("git", "pull", cwd=srcdir)
             retval = await git_process.wait()
 
-    if retval != 0:
-        payload = json.dumps({"message": "git command failed"}).encode("utf-8")
-        with aiohttp.clientSession() as session:
-            async with session.post(url=config["odb-bot"]["url"] + "/odb-dbp-ci/status", data=payload) as resp:
-                return "", resp.status
+    async with aiohttp.ClientSession() as session:
+        if retval == 0:
+            payload = json.dumps({"message": "sources updated"}).encode("utf-8")
+            await session.post(url=config["odb-bot"]["endpoints"]["status"], data=payload)
+            return True
+        else:
+            payload = json.dumps({"message": "git command failed"}).encode("utf-8")
+            await session.post(url=config["odb-bot"]["endpoints"]["status"], data=payload)
+            return False
 
 
-def iterate_dba_files():
-    for root, subdirs, files in os.walk(srcdir):
-        for f in files:
-            if not f.endswith(".dba"):
-                continue
-            yield os.path.join(root, f)
+async def do_run_all():
+    async with aiohttp.ClientSession() as session:
+        payload = json.dumps({"message": "CI run started"}).encode("utf-8")
+        await session.post(url=config["odb-bot"]["endpoints"]["status"], data=payload)
 
-
-@app.route("/run_all")
-async def run_all():
     async with lock:
-        with aiohttp.clientSession() as session:
+        async with aiohttp.ClientSession() as session:
             report = {
                 "succeeded": list(),
                 "failed": list()
             }
-            for f in iterate_dba_files():
+            for f, basename in iterate_dba_files():
 
                 # Handle invalid file names
-                if not any(f.startswith(x) for x in ("cy-ry-", "cy-rn-", "cn-", "odbc-", "dbpc-")):
+                if not any(basename.startswith(x) for x in ("cy-ry-", "cy-rn-", "cn-", "odbc-", "dbpc-")):
                     report["failed"].append({
                         "file": f,
                         "message": "Filename is invalid"
@@ -147,7 +142,7 @@ async def run_all():
                     continue
 
                 # Check that corresponding .out files exist
-                if any(f.startswith(x) for x in ("odbc-", "dbpc-")):
+                if any(basename.startswith(x) for x in ("odbc-", "dbpc-")):
                     outfile = f.replace(".dba", ".out")
                     if not os.path.exists(outfile):
                         report["failed"].append({
@@ -155,7 +150,7 @@ async def run_all():
                             "message": f"Output file {outfile} was not found"
                         })
                         continue
-                if f.startswith("cy-rn-"):
+                if basename.startswith("cy-rn-"):
                     outfile1 = f.replace(".dba", ".dbpout")
                     outfile2 = f.replace(".dba", ".odbout")
                     if not os.path.exists(outfile1):
@@ -180,7 +175,7 @@ async def run_all():
                         bot_payload = json.dumps(
                             {"message": f"dbpc endpoint returned status {dbpc_resp.status}"}).encode("utf-8")
                         await session.post(url=config["odb-bot"]["endpoints"]["status"], data=bot_payload)
-                        return "", dbpc_resp.status
+                        return False
                     dbpc_resp = await dbpc_resp.read()
                     dbpc_resp = json.loads(dbpc_resp.decode("utf-8"))
                 async with session.post(url=config["odbc"]["windows"]["endpoints"]["compile"],
@@ -190,7 +185,7 @@ async def run_all():
                             {"message": f"odbc windows endpoint returned status {odbc_windows_resp.status}"}).encode(
                             "utf-8")
                         await session.post(url=config["odb-bot"]["endpoints"]["status"], data=bot_payload)
-                        return "", odbc_windows_resp.status
+                        return False
                     odbc_windows_resp = await odbc_windows_resp.read()
                     odbc_windows_resp = json.loads(odbc_windows_resp.decode("utf-8"))
                 async with session.post(url=config["odbc"]["windows"]["endpoints"]["compile"],
@@ -200,7 +195,7 @@ async def run_all():
                             {"message": f"odbc linux endpoint returned status {odbc_linux_resp.status}"}).encode(
                             "utf-8")
                         await session.post(url=config["odb-bot"]["endpoints"]["status"], data=bot_payload)
-                        return "", odbc_linux_resp.status
+                        return False
                     odbc_linux_resp = await odbc_linux_resp.read()
                     odbc_linux_resp = json.loads(odbc_linux_resp.decode("utf-8"))
 
@@ -210,7 +205,7 @@ async def run_all():
                 odbc_linux_resp["name"] = "odbc-linux"
                 results = (dbpc_resp, odbc_windows_resp, odbc_linux_resp)
 
-                if f.startswith("cy-"):
+                if basename.startswith("cy-"):
                     if not all(x["success"] for x in results):
                         failed_names = [x["name"] for x in results if not x["success"]]
                         failed_msgs = [f"{x['name']}: {x['output']}" for x in results if not x["success"]]
@@ -219,7 +214,7 @@ async def run_all():
                             "message": f"Code failed to compile for targets: {', '.join(failed_names)}\n" + "\n".join(failed_msgs)
                         })
                         continue
-                if f.startswith("cy-ry-"):
+                if basename.startswith("cy-ry-"):
                     if not all_equal(x["output"] for x in results):
                         outputs = [f"{x['name']}: {x['output']}" for x in results]
                         report["failed"].append({
@@ -230,7 +225,7 @@ async def run_all():
                     report["succeeded"].append({
                         "file": f
                     })
-                elif f.startswith("cy-rn-"):
+                elif basename.startswith("cy-rn-"):
                     if all_equal(x["output"] for x in results):
                         outputs = [f"{x['name']}: {x['output']}" for x in results]
                         report["failed"].append({
@@ -258,7 +253,7 @@ async def run_all():
                     report["succeeded"].append({
                         "file": f
                     })
-                elif f.startswith("cn-"):
+                elif basename.startswith("cn-"):
                     if any(x["success"] for x in results):
                         failed_names = [x["name"] for x in results if x["success"]]
                         report["failed"].append({
@@ -269,22 +264,62 @@ async def run_all():
                     report["succeeded"].append({
                         "file": f
                     })
-                elif f.startswith("odbc-"):
+                elif basename.startswith("odbc-"):
                     pass
-                elif f.startswith("dbpc-"):
+                elif basename.startswith("dbpc-"):
                     pass
                 else:
                     report["failed"].append({
                         "file": f,
                         "message": "BUG: Unknown/unsupported filename"
                     })
+        open(os.path.join(workdir, "report.json"), "wb").write(json.dumps(report).encode("utf-8"))
+        async with aiohttp.ClientSession() as session:
+            payload = json.dumps({"message": "CI run completed"}).encode("utf-8")
+            await session.post(url=config["odb-bot"]["endpoints"]["status"], data=payload)
+        return True
 
+
+async def do_status():
+    async with lock:
+        pass
+
+
+@app.route("/github", methods=["POST"])
+async def github_event():
+    payload = await quart.request.get_data()
+    if not verify_signature(payload, quart.request.headers["X-Hub-Signature-256"].replace("sha256=", ""), config["github"]["secret"]):
+        quart.abort(403)
+
+    event_type = quart.request.headers["X-GitHub-Event"]
+    if not event_type == "push":
+        return "", 200
+
+    # only care about pushes to master branch
+    data = json.loads(payload.decode("utf-8"))
+    if not data["ref"].rsplit("/", 1)[-1] == "master":
+        return ""
+
+    asyncio.ensure_future(update_and_run_all())
+    return "", 200
+
+
+@app.route("/update_sources")
+async def update_sources():
+    asyncio.ensure_future(do_update_sources())
+    return "", 200
+
+
+@app.route("/run_all")
+async def run_all():
+    asyncio.ensure_future(do_run_all())
     return "", 200
 
 
 @app.route("/status")
 async def status():
-    pass
+    await do_status()
+    return "", 200
 
 
 loop = asyncio.get_event_loop()
