@@ -14,31 +14,31 @@ if not os.path.exists("config.json"):
             "host": "0.0.0.0",
             "port": 8015
         },
-        "odbc": {
-            "windows": {
+        "compilers": [
+            {
+                "type": "odb",
+                "platform": "linux",
                 "endpoints": {
-                    "compile": ""
-                }
-            },
-            "linux": {
-                "endpoints": {
-                    "compile": ""
+                    "update": "http://127.0.0.1:8016/update",
+                    "compile": "http://127.0.0.1:8016/compile",
+                    "commit_hash": "http://127.0.0.1:8016/commit-hash"
                 }
             }
-        },
-        "dbpc": {
-            "endpoints": {
-                "compile": ""
-            }
-        },
+        ],
         "odb-bot": {
             "endpoints": {
                 "status": ""
             }
         },
         "github": {
-            "url": "https://www.github.com/OpenDarkBASIC/odb-dbp-ci-sources",
-            "secret": ""
+            "ci_sources": {
+                "url": "https://www.github.com/OpenDarkBASIC/odb-dbp-ci-sources",
+                "secret": ""
+            },
+            "odbc": {
+                "url": "https://www.github.com/OpenDarkBASIC/OpenDarkBASIC",
+                "secret": ""
+            }
         }
     }, indent=2).encode("utf-8"))
     print("Created file config.json. Please edit it with the correct token now, then run the bot again")
@@ -85,7 +85,7 @@ def all_equal(l):
     return all(first == rest for rest in iterator)
 
 
-def iterate_dba_files():
+def scan_dba_files():
     for root, subdirs, files in os.walk(srcdir):
         for f in files:
             if not f.endswith(".dba"):
@@ -93,14 +93,14 @@ def iterate_dba_files():
             yield os.path.join(root, f), f
 
 
-async def update_and_run_all():
-    if not await do_update_sources():
+async def pull_and_run_all():
+    if not await do_pull_sources():
         return
     await do_run_all()
     await do_status()
 
 
-async def do_update_sources():
+async def do_pull_sources():
     async with lock:
         if not os.path.exists(srcdir):
             git_process = await asyncio.create_subprocess_exec("git", "clone", config["github"]["url"], srcdir)
@@ -120,164 +120,179 @@ async def do_update_sources():
             return False
 
 
+async def post_status_to_bot(msg):
+    try:
+        async with aiohttp.ClientSession() as session:
+            payload = json.dumps({"message": msg}).encode("utf-8")
+            await session.post(url=config["odb-bot"]["endpoints"]["status"], data=payload)
+        return True
+    except:
+        return False
+
+
 async def do_run_all():
-    async with aiohttp.ClientSession() as session:
-        payload = json.dumps({"message": "CI run started"}).encode("utf-8")
-        await session.post(url=config["odb-bot"]["endpoints"]["status"], data=payload)
+    await post_status_to_bot("CI run started")
 
     async with lock:
-        async with aiohttp.ClientSession() as session:
-            report = {
-                "succeeded": list(),
-                "failed": list()
-            }
-            for f, basename in iterate_dba_files():
+        report = {
+            "succeeded": list(),
+            "failed": list()
+        }
+        files_to_compile = list()
+        for f, basename in scan_dba_files():
 
-                # Handle invalid file names
-                if not any(basename.startswith(x) for x in ("cy-ry-", "cy-rn-", "cn-", "odbc-", "dbpc-")):
+            # Handle invalid file names
+            if not any(basename.startswith(x) for x in ("cy-ry-", "cy-rn-", "cn-", "odbc-", "dbpc-")):
+                report["failed"].append({
+                    "file": f,
+                    "message": "Filename is invalid"
+                })
+                continue
+
+            # Check that corresponding .out files exist
+            if any(basename.startswith(x) for x in ("odbc-", "dbpc-")):
+                outfile = f.replace(".dba", ".out")
+                if not os.path.exists(outfile):
                     report["failed"].append({
                         "file": f,
-                        "message": "Filename is invalid"
+                        "message": f"Output file {outfile} was not found"
+                    })
+                    continue
+            if basename.startswith("cy-rn-"):
+                outfile1 = f.replace(".dba", ".dbpout")
+                outfile2 = f.replace(".dba", ".odbout")
+                if not os.path.exists(outfile1):
+                    report["failed"].append({
+                        "file": f,
+                        "message": f"Output file {outfile1} was not found"
+                    })
+                    continue
+                if not os.path.exists(outfile2):
+                    report["failed"].append({
+                        "file": f,
+                        "message": f"Output file {outfile2} was not found"
+                    })
+                    continue
+            files_to_compile.append((f, basename))
+
+        # Compile the code on all available compilers
+        async def do_compile(compiler, filename):
+            code_payload = json.dumps({
+                "code": open(filename, "rb").read().decode("utf-8")
+            }).encode("utf-8")
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url=compiler["endpoints"]["compile"], data=code_payload) as resp:
+                        if resp.status != 200:
+                            return False, compiler, filename, f"Endpoint for {compiler['type']}-{compiler['platform']} returned {resp.status}"
+                        resp = await resp.read()
+                        resp = json.loads(resp.decode("utf-8"))
+                        return True, compiler, filename, resp
+            except:
+                return False, compiler, filename, "Failed to connect to endpoint"
+        compile_results = await asyncio.gather(*[
+            do_compile(compiler, filename)
+            for filename, basename in files_to_compile
+            for compiler in config["compilers"]])
+
+        # sort compiler results by filename/compiler type/platform
+        d = dict()
+        for success, compiler, filename, response in compile_results:
+            if not success:
+                await post_status_to_bot(response)
+                return False
+            d.setdefault(filename, dict()).setdefault(compiler["type"], dict()).setdefault(compiler["platform"], {
+                "success": response["success"],
+                "output": response["output"]
+            })
+        compile_results = d
+
+        for filename, compiler_types in compile_results.items():
+            basename = os.path.basename(filename)
+            if basename.startswith("cy-"):
+                if not all(result["success"]
+                           for compiler_type, compiler_plats in compiler_types.items()
+                           for compiler_plat, result in compiler_plats.items()):
+                    failed_names = [f"{compiler_type}/{compiler_plat}"
+                                    for compiler_type, compiler_plats in compiler_types.items()
+                                    for compiler_plat, result in compiler_plats.items()
+                                    if not result["success"]]
+                    failed_msgs = [f"{compiler_type}/{compiler_plat}: {result['output']}"
+                                   for compiler_type, compiler_plats in compiler_types.items()
+                                   for compiler_plat, result in compiler_plats.items()
+                                   if not result["success"]]
+                    report["failed"].append({
+                        "file": f,
+                        "message": f"Code failed to compile for targets: {', '.join(failed_names)}\n" + "\n".join(failed_msgs)
                     })
                     continue
 
-                # Check that corresponding .out files exist
-                if any(basename.startswith(x) for x in ("odbc-", "dbpc-")):
-                    outfile = f.replace(".dba", ".out")
-                    if not os.path.exists(outfile):
-                        report["failed"].append({
-                            "file": f,
-                            "message": f"Output file {outfile} was not found"
-                        })
-                        continue
-                if basename.startswith("cy-rn-"):
-                    outfile1 = f.replace(".dba", ".dbpout")
-                    outfile2 = f.replace(".dba", ".odbout")
-                    if not os.path.exists(outfile1):
-                        report["failed"].append({
-                            "file": f,
-                            "message": f"Output file {outfile1} was not found"
-                        })
-                        continue
-                    if not os.path.exists(outfile2):
-                        report["failed"].append({
-                            "file": f,
-                            "message": f"Output file {outfile2} was not found"
-                        })
-                        continue
+            # If we reach this point and the file begins with "cy-" then it did compile successfully
 
-                # Compile the code on all available compilers
-                code_payload = json.dumps({
-                    "code": open(f, "rb").read().decode("utf-8")
-                })
-                async with session.post(url=config["dbpc"]["endpoints"]["compile"], data=code_payload) as dbpc_resp:
-                    if dbpc_resp.status != 200:
-                        bot_payload = json.dumps(
-                            {"message": f"dbpc endpoint returned status {dbpc_resp.status}"}).encode("utf-8")
-                        await session.post(url=config["odb-bot"]["endpoints"]["status"], data=bot_payload)
-                        return False
-                    dbpc_resp = await dbpc_resp.read()
-                    dbpc_resp = json.loads(dbpc_resp.decode("utf-8"))
-                async with session.post(url=config["odbc"]["windows"]["endpoints"]["compile"],
-                                        data=code_payload) as odbc_windows_resp:
-                    if odbc_windows_resp.status != 200:
-                        bot_payload = json.dumps(
-                            {"message": f"odbc windows endpoint returned status {odbc_windows_resp.status}"}).encode(
-                            "utf-8")
-                        await session.post(url=config["odb-bot"]["endpoints"]["status"], data=bot_payload)
-                        return False
-                    odbc_windows_resp = await odbc_windows_resp.read()
-                    odbc_windows_resp = json.loads(odbc_windows_resp.decode("utf-8"))
-                async with session.post(url=config["odbc"]["windows"]["endpoints"]["compile"],
-                                        data=code_payload) as odbc_linux_resp:
-                    if odbc_linux_resp.status != 200:
-                        bot_payload = json.dumps(
-                            {"message": f"odbc linux endpoint returned status {odbc_linux_resp.status}"}).encode(
-                            "utf-8")
-                        await session.post(url=config["odb-bot"]["endpoints"]["status"], data=bot_payload)
-                        return False
-                    odbc_linux_resp = await odbc_linux_resp.read()
-                    odbc_linux_resp = json.loads(odbc_linux_resp.decode("utf-8"))
-
-                # put the results into a list and add some more data to make it easier to work with
-                dbpc_resp["name"] = "dbpc"
-                odbc_windows_resp["name"] = "odbc-windows"
-                odbc_linux_resp["name"] = "odbc-linux"
-                results = (dbpc_resp, odbc_windows_resp, odbc_linux_resp)
-
-                if basename.startswith("cy-"):
-                    if not all(x["success"] for x in results):
-                        failed_names = [x["name"] for x in results if not x["success"]]
-                        failed_msgs = [f"{x['name']}: {x['output']}" for x in results if not x["success"]]
-                        report["failed"].append({
-                            "file": f,
-                            "message": f"Code failed to compile for targets: {', '.join(failed_names)}\n" + "\n".join(failed_msgs)
-                        })
-                        continue
-                if basename.startswith("cy-ry-"):
-                    if not all_equal(x["output"] for x in results):
-                        outputs = [f"{x['name']}: {x['output']}" for x in results]
-                        report["failed"].append({
-                            "file": f,
-                            "message": f"Output is different between targets\n" + "\n".join(outputs)
-                        })
-                        continue
-                    report["succeeded"].append({
-                        "file": f
-                    })
-                elif basename.startswith("cy-rn-"):
-                    if all_equal(x["output"] for x in results):
-                        outputs = [f"{x['name']}: {x['output']}" for x in results]
-                        report["failed"].append({
-                            "file": f,
-                            "message": "Output was identical for all targets, but it was expected to be different\n" + "\n".join(outputs)
-                        })
-                        continue
-                    for result in results:
-                        if result["name"] == "dbpc":
-                            expected = open(f.replace(".dba", ".dbpout"), "rb").read().decode("utf-8")
-                        elif result["name"] in ("odbc-windows", "odbc-linux"):
-                            expected = open(f.replace(".dba", ".odbout"), "rb").read().decode("utf-8")
-                        if not result["output"] == expected:
-                            report["failed"].append({
-                                "file": f,
-                                "message": f"{result['name']}: Expected output: {expected}\nActual output: {result['output']}"
-                            })
-                            continue
-                        if not result["output"] == expected:
-                            report["failed"].append({
-                                "file": f,
-                                "message": f"{result['name']}: Expected output: {expected}\nActual output: {result['output']}"
-                            })
-                            continue
-                    report["succeeded"].append({
-                        "file": f
-                    })
-                elif basename.startswith("cn-"):
-                    if any(x["success"] for x in results):
-                        failed_names = [x["name"] for x in results if x["success"]]
-                        report["failed"].append({
-                            "file": f,
-                            "message": f"Code compiled for targets: {', '.join(failed_names)}\n"
-                        })
-                        continue
-                    report["succeeded"].append({
-                        "file": f
-                    })
-                elif basename.startswith("odbc-"):
-                    pass
-                elif basename.startswith("dbpc-"):
-                    pass
-                else:
+            if basename.startswith("cy-ry-"):
+                if not all_equal(result["output"] for compiler_type, compiler_plats in compiler_types.items() for compiler_plat, result in compiler_plats.items()):
+                    outputs = [f"{compiler_type}/{compiler_plat}: {result['output']}"
+                               for compiler_type, compiler_plats in compiler_types.items()
+                               for compiler_plat, result in compiler_plats.items()]
                     report["failed"].append({
                         "file": f,
-                        "message": "BUG: Unknown/unsupported filename"
+                        "message": f"Output is different between targets\n" + "\n".join(outputs)
                     })
-        open(os.path.join(workdir, "report.json"), "wb").write(json.dumps(report).encode("utf-8"))
-        async with aiohttp.ClientSession() as session:
-            payload = json.dumps({"message": "CI run completed"}).encode("utf-8")
-            await session.post(url=config["odb-bot"]["endpoints"]["status"], data=payload)
-        return True
+                    continue
+                report["succeeded"].append({
+                    "file": f
+                })
+            elif basename.startswith("cy-rn-"):
+                if all_equal(x["output"] for x in results):
+                    outputs = [f"{x['name']}: {x['output']}" for x in results]
+                    report["failed"].append({
+                        "file": f,
+                        "message": "Output was identical for all targets, but it was expected to be different\n" + "\n".join(outputs)
+                    })
+                    continue
+                for result in results:
+                    if result["name"] == "dbpc":
+                        expected = open(f.replace(".dba", ".dbpout"), "rb").read().decode("utf-8")
+                    elif result["name"] in ("odbc-windows", "odbc-linux"):
+                        expected = open(f.replace(".dba", ".odbout"), "rb").read().decode("utf-8")
+                    if not result["output"] == expected:
+                        report["failed"].append({
+                            "file": f,
+                            "message": f"{result['name']}: Expected output: {expected}\nActual output: {result['output']}"
+                        })
+                        continue
+                    if not result["output"] == expected:
+                        report["failed"].append({
+                            "file": f,
+                            "message": f"{result['name']}: Expected output: {expected}\nActual output: {result['output']}"
+                        })
+                        continue
+                report["succeeded"].append({
+                    "file": f
+                })
+            elif basename.startswith("cn-"):
+                if any(x["success"] for x in results):
+                    failed_names = [x["name"] for x in results if x["success"]]
+                    report["failed"].append({
+                        "file": f,
+                        "message": f"Code compiled for targets: {', '.join(failed_names)}\n"
+                    })
+                    continue
+                report["succeeded"].append({
+                    "file": f
+                })
+            elif basename.startswith("odbc-"):
+                pass
+            elif basename.startswith("dbpc-"):
+                pass
+            else:
+                report["failed"].append({
+                    "file": f,
+                    "message": "BUG: Unknown/unsupported filename"
+                })
+    open(os.path.join(workdir, "report.json"), "wb").write(json.dumps(report).encode("utf-8"))
+    await post_status_to_bot("CI run completed")
+    return True
 
 
 async def do_status():
@@ -285,8 +300,8 @@ async def do_status():
         pass
 
 
-@app.route("/github", methods=["POST"])
-async def github_event():
+@app.route("/ci-sources-push", methods=["POST"])
+async def github_event_ci_sources_pushed():
     payload = await quart.request.get_data()
     if not verify_signature(payload, quart.request.headers["X-Hub-Signature-256"].replace("sha256=", ""), config["github"]["secret"]):
         quart.abort(403)
@@ -300,19 +315,37 @@ async def github_event():
     if not data["ref"].rsplit("/", 1)[-1] == "master":
         return ""
 
-    asyncio.ensure_future(update_and_run_all())
+    asyncio.ensure_future(pull_and_run_all())
     return "", 200
 
 
-@app.route("/update_sources")
-async def update_sources():
-    asyncio.ensure_future(do_update_sources())
+@app.route("/odbc-push", methods=["POST"])
+async def github_event_odb_pushed():
+    payload = await quart.request.get_data()
+    if not verify_signature(payload, quart.request.headers["X-Hub-Signature-256"].replace("sha256=", ""), config["github"]["secret"]):
+        quart.abort(403)
+
+    event_type = quart.request.headers["X-GitHub-Event"]
+    if not event_type == "push":
+        return "", 200
+
+    # only care about pushes to master branch
+    data = json.loads(payload.decode("utf-8"))
+    if not data["ref"].rsplit("/", 1)[-1] == "master":
+        return ""
+
     return "", 200
 
 
-@app.route("/run_all")
+@app.route("/pull-sources")
+async def pull_sources():
+    await do_pull_sources()
+    return "", 200
+
+
+@app.route("/run-all")
 async def run_all():
-    asyncio.ensure_future(do_run_all())
+    await do_run_all()
     return "", 200
 
 
