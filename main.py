@@ -6,6 +6,7 @@ import traceback
 import hashlib
 import hmac
 import aiohttp
+import re
 
 
 if not os.path.exists("config.json"):
@@ -16,12 +17,21 @@ if not os.path.exists("config.json"):
         },
         "compilers": [
             {
+                "type": "dbp",
+                "platform": "windows",
+                "endpoints": {
+                    "update": "http://127.0.0.1:8014/update",
+                    "compile": "http://127.0.0.1:8014/compile",
+                    "commit_hash": "http://127.0.0.1:8014/commit_hash"
+                },
+            },
+            {
                 "type": "odb",
                 "platform": "linux",
                 "endpoints": {
-                    "update": "http://127.0.0.1:8016/update",
-                    "compile": "http://127.0.0.1:8016/compile",
-                    "commit_hash": "http://127.0.0.1:8016/commit-hash"
+                    "update": "http://127.0.0.1:8014/update",
+                    "compile": "http://127.0.0.1:8014/compile",
+                    "commit_hash": "http://127.0.0.1:8014/commit_hash"
                 }
             }
         ],
@@ -29,6 +39,9 @@ if not os.path.exists("config.json"):
             "endpoints": {
                 "status": ""
             }
+        },
+        "git": {
+            "command": "git"
         },
         "github": {
             "ci_sources": {
@@ -79,7 +92,7 @@ def create_signature(payload, secret):
 def all_equal(l):
     iterator = iter(l)
     try:
-        first = next(l)
+        first = next(iterator)
     except StopIteration:
         return True
     return all(first == rest for rest in iterator)
@@ -93,6 +106,14 @@ def scan_dba_files():
             yield os.path.join(root, f), f
 
 
+def load_outfile(outfile):
+    expected = open(outfile, "rb").read().decode("utf-8")
+    match = re.match(r"\"(.*)\"", expected)
+    if not match:
+        return None
+    return match.group(1).replace("\\n", "\n")
+
+
 async def pull_and_run_all():
     if not await do_pull_sources():
         return
@@ -103,21 +124,16 @@ async def pull_and_run_all():
 async def do_pull_sources():
     async with lock:
         if not os.path.exists(srcdir):
-            git_process = await asyncio.create_subprocess_exec("git", "clone", config["github"]["url"], srcdir)
+            git_process = await asyncio.create_subprocess_exec(config["git"]["command"], "clone", config["github"]["ci_sources"]["url"], srcdir)
             retval = await git_process.wait()
         else:
-            git_process = await asyncio.create_subprocess_exec("git", "pull", cwd=srcdir)
+            git_process = await asyncio.create_subprocess_exec(config["git"]["command"], "pull", cwd=srcdir)
             retval = await git_process.wait()
 
-    async with aiohttp.ClientSession() as session:
-        if retval == 0:
-            payload = json.dumps({"message": "sources updated"}).encode("utf-8")
-            await session.post(url=config["odb-bot"]["endpoints"]["status"], data=payload)
-            return True
-        else:
-            payload = json.dumps({"message": "git command failed"}).encode("utf-8")
-            await session.post(url=config["odb-bot"]["endpoints"]["status"], data=payload)
-            return False
+    if retval == 0:
+        return True, ""
+    else:
+        return False, "git command failed"
 
 
 async def post_status_to_bot(msg):
@@ -131,8 +147,6 @@ async def post_status_to_bot(msg):
 
 
 async def do_run_all():
-    await post_status_to_bot("CI run started")
-
     async with lock:
         report = {
             "succeeded": list(),
@@ -177,6 +191,7 @@ async def do_run_all():
 
         # Compile the code on all available compilers
         async def do_compile(compiler, filename):
+            print(f"compiling {filename} with {compiler['type']}/{compiler['platform']}")
             code_payload = json.dumps({
                 "code": open(filename, "rb").read().decode("utf-8")
             }).encode("utf-8")
@@ -209,95 +224,208 @@ async def do_run_all():
 
         for filename, compiler_types in compile_results.items():
             basename = os.path.basename(filename)
-            if basename.startswith("cy-"):
-                if not all(result["success"]
-                           for compiler_type, compiler_plats in compiler_types.items()
-                           for compiler_plat, result in compiler_plats.items()):
-                    failed_names = [f"{compiler_type}/{compiler_plat}"
-                                    for compiler_type, compiler_plats in compiler_types.items()
-                                    for compiler_plat, result in compiler_plats.items()
+
+            # first of all, make sure that all ODB outputs are identical and all DBP outputs are identical. The same
+            # compiler on different platforms should always behave the same
+            if any(basename.startswith(x) for x in ("cy-", "dbpc-")):
+                if not all(result["success"] for compiler_plat, result in compiler_types["dbp"].items()):
+                    failed_names = [f"dbp/{compiler_plat}"
+                                    for compiler_plat, result in compiler_types["dbp"].items()
                                     if not result["success"]]
-                    failed_msgs = [f"{compiler_type}/{compiler_plat}: {result['output']}"
-                                   for compiler_type, compiler_plats in compiler_types.items()
-                                   for compiler_plat, result in compiler_plats.items()
+                    failed_msgs = [f"dbp/{compiler_plat}: {result['output']}"
+                                   for compiler_plat, result in compiler_types["dbp"].items()
                                    if not result["success"]]
                     report["failed"].append({
-                        "file": f,
+                        "file": filename,
                         "message": f"Code failed to compile for targets: {', '.join(failed_names)}\n" + "\n".join(failed_msgs)
                     })
                     continue
 
-            # If we reach this point and the file begins with "cy-" then it did compile successfully
+                dbp_outputs = [result["output"] for compiler_plat, result in compiler_types["dbp"].items()]
+                if not all_equal(dbp_outputs):
+                    dbp_msgs = [f"dbp/{compiler_plat}: {result['output']}"
+                                for compiler_plat, result in compiler_types["dbp"].items()]
+                    report["failed"].append({
+                        "file": filename,
+                        "message": "Not all DBP outputs were the same!\n" + "\n".join(dbp_msgs)
+                    })
+                    continue
+                dbp_output = dbp_outputs[0]
+
+            if any(basename.startswith(x) for x in ("cy-", "odbc-")):
+                if not all(result["success"] for compiler_plat, result in compiler_types["odb"].items()):
+                    failed_names = [f"odb/{compiler_plat}"
+                                    for compiler_plat, result in compiler_types["odb"].items()
+                                    if not result["success"]]
+                    failed_msgs = [f"odb/{compiler_plat}: {result['output']}"
+                                   for compiler_plat, result in compiler_types["odb"].items()
+                                   if not result["success"]]
+                    report["failed"].append({
+                        "file": filename,
+                        "message": f"Code failed to compile for targets: {', '.join(failed_names)}\n" + "\n".join(failed_msgs)
+                    })
+                    continue
+
+                odb_outputs = [result["output"] for compiler_plat, result in compiler_types["odb"].items()]
+                if not all_equal(odb_outputs):
+                    odb_msgs = [f"odb/{compiler_plat}: {result['output']}"
+                                for compiler_plat, result in compiler_types["odb"].items()]
+                    report["failed"].append({
+                        "file": filename,
+                        "message": "Not all DBP outputs were the same!\n" + "\n".join(odb_msgs)
+                    })
+                    continue
+                odb_output = odb_outputs[0]
+
+            # If we reach this point and the file begins with "cy-", "odbc-", or "dbpc-",
+            # then it did compile successfully
 
             if basename.startswith("cy-ry-"):
-                if not all_equal(result["output"] for compiler_type, compiler_plats in compiler_types.items() for compiler_plat, result in compiler_plats.items()):
-                    outputs = [f"{compiler_type}/{compiler_plat}: {result['output']}"
-                               for compiler_type, compiler_plats in compiler_types.items()
-                               for compiler_plat, result in compiler_plats.items()]
+                if not dbp_output == odb_output:
                     report["failed"].append({
-                        "file": f,
-                        "message": f"Output is different between targets\n" + "\n".join(outputs)
+                        "file": filename,
+                        "message": f"Output is different between targets\nODB: {odb_output}\nDBP: {dbp_output}"
                     })
                     continue
+
+                # The .out file is optional, but if it exists, make sure the output is correct
+                outfile = filename.replace(".dba", ".out")
+                if os.path.exists(outfile):
+                    expected = load_outfile(outfile)
+                    if expected is None:
+                        report["failed"].append({
+                            "file": filename,
+                            "message": f"Outfile contains invalid data/is incorrectly formatted"
+                        })
+                        continue
+                    if not dbp_output == expected:
+                        report["failed"].append({
+                            "file": filename,
+                            "message": f"Output is different from expected .out file\nExpected: {expected}\nActual: {dbp_output}"
+                        })
+                        continue
+                    if not odb_output == expected:
+                        report["failed"].append({
+                            "file": filename,
+                            "message": f"Output is different from expected .out file\nExpected: {expected}\nActual: {odb_output}"
+                        })
+                        continue
+
                 report["succeeded"].append({
-                    "file": f
+                    "file": filename
                 })
+
             elif basename.startswith("cy-rn-"):
-                if all_equal(x["output"] for x in results):
-                    outputs = [f"{x['name']}: {x['output']}" for x in results]
+                if dbp_output == odb_output:
                     report["failed"].append({
-                        "file": f,
-                        "message": "Output was identical for all targets, but it was expected to be different\n" + "\n".join(outputs)
+                        "file": filename,
+                        "message": f"Output was identical on all targets, but it was expected to be different\nODB: {odb_output}\nDBP: {dbp_output}"
                     })
                     continue
-                for result in results:
-                    if result["name"] == "dbpc":
-                        expected = open(f.replace(".dba", ".dbpout"), "rb").read().decode("utf-8")
-                    elif result["name"] in ("odbc-windows", "odbc-linux"):
-                        expected = open(f.replace(".dba", ".odbout"), "rb").read().decode("utf-8")
-                    if not result["output"] == expected:
-                        report["failed"].append({
-                            "file": f,
-                            "message": f"{result['name']}: Expected output: {expected}\nActual output: {result['output']}"
-                        })
-                        continue
-                    if not result["output"] == expected:
-                        report["failed"].append({
-                            "file": f,
-                            "message": f"{result['name']}: Expected output: {expected}\nActual output: {result['output']}"
-                        })
-                        continue
+
+                dbp_expected = open(filename.replace(".dba", ".dbpout"), "rb").read().decode("utf-8")
+                odb_expected = open(filename.replace(".dba", ".odbout"), "rb").read().decode("utf-8")
+                if not dbp_output == dbp_expected:
+                    report["failed"].append({
+                        "file": filename,
+                        "message": f"Expected: {dbp_expected}\nActual: {dbp_output}"
+                    })
+                    continue
+                if not odb_output == odb_expected:
+                    report["failed"].append({
+                        "file": filename,
+                        "message": f"Expected: {odb_expected}\nActual: {odb_output}"
+                    })
+                    continue
                 report["succeeded"].append({
-                    "file": f
+                    "file": filename
                 })
+
             elif basename.startswith("cn-"):
-                if any(x["success"] for x in results):
-                    failed_names = [x["name"] for x in results if x["success"]]
+                if any(result["success"]
+                       for compiler_type, compiler_plats in compiler_types.items()
+                       for compiler_plat, result in compiler_plats.items()):
+                    failed_names = [f"{compiler_type}/{compiler_plat}"
+                                    for compiler_type, compiler_plats in compiler_types.items()
+                                    for compiler_plat, result in compiler_plats.items()
+                                    if result["success"]]
                     report["failed"].append({
-                        "file": f,
-                        "message": f"Code compiled for targets: {', '.join(failed_names)}\n"
+                        "file": filename,
+                        "message": f"Code expected not to compile, but compiled for targets: {', '.join(failed_names)}"
                     })
                     continue
+
                 report["succeeded"].append({
-                    "file": f
+                    "file": filename
                 })
+
             elif basename.startswith("odbc-"):
-                pass
+                if any(result["success"] for compiler_plat, result in compiler_types["dbp"].items()):
+                    failed_names = [f"dbp/{compiler_plat}"
+                                    for compiler_plat, result in compiler_types["dbp"].items()
+                                    if result["success"]]
+                    report["failed"].append({
+                        "file": filename,
+                        "message": f"Code expected to not compile on DBP, but compiled on targets: {', '.join(failed_names)}"
+                    })
+                    continue
+
+                expected = open(filename.replace(".dba", ".out"), "rb").read().decode("utf-8")
+                if not odb_output == expected:
+                    report["failed"].append({
+                        "file": filename,
+                        "message": f"Expected: {expected}\nActual: {odb_output}"
+                    })
+                    continue
+
+                report["succeeded"].append({
+                    "file": filename
+                })
+
             elif basename.startswith("dbpc-"):
-                pass
+                if any(result["success"] for compiler_plat, result in compiler_types["odb"].items()):
+                    failed_names = [f"odb/{compiler_plat}"
+                                    for compiler_plat, result in compiler_types["odb"].items()
+                                    if result["success"]]
+                    report["failed"].append({
+                        "file": filename,
+                        "message": f"Code expected to not compile on DBP, but compiled on targets: {', '.join(failed_names)}"
+                    })
+                    continue
+
+                expected = open(filename.replace(".dba", ".out"), "rb").read().decode("utf-8")
+                if not dbp_output == expected:
+                    report["failed"].append({
+                        "file": filename,
+                        "message": f"Expected: {expected}\nActual: {dbp_output}"
+                    })
+                    continue
+
+                report["succeeded"].append({
+                    "file": filename
+                })
+
             else:
                 report["failed"].append({
                     "file": f,
                     "message": "BUG: Unknown/unsupported filename"
                 })
     open(os.path.join(workdir, "report.json"), "wb").write(json.dumps(report).encode("utf-8"))
-    await post_status_to_bot("CI run completed")
     return True
 
 
 async def do_status():
     async with lock:
-        pass
+        report = json.loads(open(os.path.join(workdir, "report.json"), "rb").read().decode("utf-8"))
+
+    failed_count = len(report["failed"])
+    success_count = len(report["succeeded"])
+    total_count = failed_count + success_count
+
+    msgs = [f"{success_count}/{total_count} test cases succeeded"]
+    for failed in report["failed"][:2]:
+        msgs.append(f"{failed['file']}\n{failed['message']}")
+    await post_status_to_bot("\n\n".join(msgs))
 
 
 @app.route("/ci-sources-push", methods=["POST"])
@@ -308,15 +436,16 @@ async def github_event_ci_sources_pushed():
 
     event_type = quart.request.headers["X-GitHub-Event"]
     if not event_type == "push":
-        return "", 200
+        return ""
 
     # only care about pushes to master branch
     data = json.loads(payload.decode("utf-8"))
     if not data["ref"].rsplit("/", 1)[-1] == "master":
         return ""
 
+    await post_status_to_bot("CI run started")
     asyncio.ensure_future(pull_and_run_all())
-    return "", 200
+    return ""
 
 
 @app.route("/odbc-push", methods=["POST"])
@@ -327,14 +456,14 @@ async def github_event_odb_pushed():
 
     event_type = quart.request.headers["X-GitHub-Event"]
     if not event_type == "push":
-        return "", 200
+        return ""
 
     # only care about pushes to master branch
     data = json.loads(payload.decode("utf-8"))
     if not data["ref"].rsplit("/", 1)[-1] == "master":
         return ""
 
-    return "", 200
+    return ""
 
 
 @app.route("/pull-sources")
