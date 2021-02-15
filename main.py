@@ -13,7 +13,7 @@ if not os.path.exists("config.json"):
     open("config.json", "wb").write(json.dumps({
         "server": {
             "host": "0.0.0.0",
-            "port": 8015
+            "port": 8016
         },
         "compilers": [
             {
@@ -21,7 +21,7 @@ if not os.path.exists("config.json"):
                 "platform": "windows",
                 "endpoints": {
                     "update": "http://127.0.0.1:8014/update",
-                    "compile": "http://127.0.0.1:8014/compile",
+                    "compile_multi": "http://127.0.0.1:8014/compile_multi",
                     "commit_hash": "http://127.0.0.1:8014/commit_hash"
                 },
             },
@@ -30,7 +30,7 @@ if not os.path.exists("config.json"):
                 "platform": "linux",
                 "endpoints": {
                     "update": "http://127.0.0.1:8014/update",
-                    "compile": "http://127.0.0.1:8014/compile",
+                    "compile_multi": "http://127.0.0.1:8014/compile_multi",
                     "commit_hash": "http://127.0.0.1:8014/commit_hash"
                 }
             }
@@ -190,36 +190,35 @@ async def do_run_all():
             files_to_compile.append((f, basename))
 
         # Compile the code on all available compilers
-        async def do_compile(compiler, filename):
-            print(f"compiling {filename} with {compiler['type']}/{compiler['platform']}")
-            code_payload = json.dumps({
-                "code": open(filename, "rb").read().decode("utf-8")
-            }).encode("utf-8")
+        async def do_compile(compiler, file_list):
+            code_list = (open(filename, "rb").read().decode("utf-8") for filename in file_list)
+            code_payloads = [{"code": code} for code in code_list]
+            payload = json.dumps(code_payloads).encode("utf-8")
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.post(url=compiler["endpoints"]["compile"], data=code_payload) as resp:
+                    async with session.post(url=compiler["endpoints"]["compile_multi"], data=payload) as resp:
                         if resp.status != 200:
-                            return False, compiler, filename, f"Endpoint for {compiler['type']}-{compiler['platform']} returned {resp.status}"
+                            return False, compiler, f"Endpoint for {compiler['type']}-{compiler['platform']} returned {resp.status}"
                         resp = await resp.read()
                         resp = json.loads(resp.decode("utf-8"))
-                        return True, compiler, filename, resp
+                        return True, compiler, resp
             except:
-                return False, compiler, filename, "Failed to connect to endpoint"
+                return False, compiler, "Failed to connect to endpoint"
         compile_results = await asyncio.gather(*[
-            do_compile(compiler, filename)
-            for filename, basename in files_to_compile
+            do_compile(compiler, [filename for filename, basename in files_to_compile])
             for compiler in config["compilers"]])
 
         # sort compiler results by filename/compiler type/platform
         d = dict()
-        for success, compiler, filename, response in compile_results:
+        for success, compiler, response in compile_results:
             if not success:
                 await post_status_to_bot(response)
                 return False
-            d.setdefault(filename, dict()).setdefault(compiler["type"], dict()).setdefault(compiler["platform"], {
-                "success": response["success"],
-                "output": response["output"]
-            })
+            for filename, basename, single_response in (list(fb)+[r] for fb, r in zip(files_to_compile, response)):
+                d.setdefault(filename, dict()).setdefault(compiler["type"], dict()).setdefault(compiler["platform"], {
+                    "success": single_response["success"],
+                    "output": single_response["output"]
+                })
         compile_results = d
 
         for filename, compiler_types in compile_results.items():
