@@ -476,7 +476,7 @@ async def do_status():
 @app.route("/ci_sources_push", methods=["POST"])
 async def github_event_ci_sources_pushed():
     payload = await quart.request.get_data()
-    if not verify_signature(payload, quart.request.headers["X-Hub-Signature-256"].replace("sha256=", ""), config["github"]["secret"]):
+    if not verify_signature(payload, quart.request.headers["X-Hub-Signature-256"].replace("sha256=", ""), config["github"]["ci_sources"]["secret"]):
         quart.abort(403)
 
     event_type = quart.request.headers["X-GitHub-Event"]
@@ -496,7 +496,7 @@ async def github_event_ci_sources_pushed():
 @app.route("/odbc_push", methods=["POST"])
 async def github_event_odb_pushed():
     payload = await quart.request.get_data()
-    if not verify_signature(payload, quart.request.headers["X-Hub-Signature-256"].replace("sha256=", ""), config["github"]["secret"]):
+    if not verify_signature(payload, quart.request.headers["X-Hub-Signature-256"].replace("sha256=", ""), config["github"]["odbc"]["secret"]):
         quart.abort(403)
 
     event_type = quart.request.headers["X-GitHub-Event"]
@@ -505,7 +505,8 @@ async def github_event_odb_pushed():
 
     # only care about pushes to master branch
     data = json.loads(payload.decode("utf-8"))
-    if not data["ref"].rsplit("/", 1)[-1] == "master":
+    ref = data["ref"].rsplit("/", 1)[-1] == "master":
+    if ref not in ("master", "devel"):
         return ""
 
     return ""
