@@ -505,7 +505,7 @@ async def github_event_odb_pushed():
 
     # only care about pushes to master branch
     data = json.loads(payload.decode("utf-8"))
-    ref = data["ref"].rsplit("/", 1)[-1] == "master":
+    ref = data["ref"].rsplit("/", 1)[-1]
     if ref not in ("master", "devel"):
         return ""
 
