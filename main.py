@@ -125,7 +125,7 @@ async def do_pull_sources():
             retval = await git_process.wait()
 
     if retval == 0:
-        return True, ""
+        return True, "Sources pulled"
     else:
         return False, "git command failed"
 
@@ -480,7 +480,7 @@ async def do_run_all():
                     "message": "BUG: Unknown/unsupported filename"
                 })
     open(os.path.join(cachedir, "report.json"), "wb").write(json.dumps(report).encode("utf-8"))
-    return True
+    return True, "Run completed"
 
 
 async def do_status():
@@ -494,7 +494,7 @@ async def do_status():
     msgs = [f"{success_count}/{total_count} test cases succeeded"]
     for failed in report["failed"][:2]:
         msgs.append(f"{os.path.basename(failed['file'])}\n{failed['message']}")
-    await post_status_to_bot("\n\n".join(msgs))
+    return True, "\n\n".join(msgs)
 
 
 @app.route("/ci_sources_push", methods=["POST"])
@@ -565,8 +565,8 @@ async def github_event_odb_pushed():
 
 @app.route("/pull_sources")
 async def pull_sources():
-    await do_pull_sources()
-    await post_status_to_bot("Sources pulled")
+    success, msg = await do_pull_sources()
+    await post_status_to_bot(msg)
     return ""
 
 
@@ -590,7 +590,11 @@ async def clear_cache():
 @app.route("/run_all")
 async def run_all():
     await post_status_to_bot("[CI] CI run started")
-    await do_run_all()
+    success, msg = await do_run_all()
+    if not success:
+        await post_status_to_bot(msg)
+        return ""
+
     await do_status()
     return ""
 
