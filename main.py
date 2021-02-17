@@ -223,7 +223,7 @@ async def do_run_all():
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url=compiler["endpoints"]["commit_hash"]) as resp:
                         if resp.status != 200:
-                            return False, compiler, f"Endpoint for {compiler['type']}-{compiler['platform']} returned {resp.status}"
+                            return False, compiler, f"Endpoint for {compiler['type']}/{compiler['platform']} returned {resp.status}"
                         resp = await resp.read()
                         resp = json.loads(resp.decode("utf-8"))
                         return True, compiler, resp["commit_hash"]
@@ -268,7 +268,7 @@ async def do_run_all():
                 async with aiohttp.ClientSession() as session:
                     async with session.post(url=compiler["endpoints"]["compile"], data=code_payload) as resp:
                         if resp.status != 200:
-                            return False, compiler, filename, f"Endpoint for {compiler['type']}-{compiler['platform']} returned {resp.status}"
+                            return False, compiler, filename, f"Endpoint for {compiler['type']}/{compiler['platform']} returned {resp.status}"
                         resp = await resp.read()
                         open(cached_outfile, "wb").write(resp)
                         resp = json.loads(resp.decode("utf-8"))
@@ -523,7 +523,8 @@ async def github_event_ci_sources_pushed():
         if not success:
             return await post_status_to_bot(msg)
 
-        await do_status()
+        success, msg = await do_status()
+        await post_status_to_bot(msg)
 
     asyncio.ensure_future(pull_and_run_all())
     return ""
@@ -556,7 +557,8 @@ async def github_event_odb_pushed():
         if not success:
             return await post_status_to_bot(msg)
 
-        await do_status()
+        success, msg = await do_status()
+        await post_status_to_bot(msg)
 
     asyncio.ensure_future(update_odb_and_run_all())
 
@@ -595,13 +597,17 @@ async def run_all():
         await post_status_to_bot(msg)
         return ""
 
-    await do_status()
+    success, msg = await do_status()
+    await post_status_to_bot(msg)
+
     return ""
 
 
 @app.route("/status")
 async def status():
-    await do_status()
+    success, msg = await do_status()
+    await post_status_to_bot(msg)
+
     return ""
 
 
