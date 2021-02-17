@@ -115,13 +115,6 @@ def load_outfile(outfile):
     return match.group(1).replace("\\n", "\n")
 
 
-async def pull_and_run_all():
-    if not await do_pull_sources():
-        return
-    await do_run_all()
-    await do_status()
-
-
 async def do_pull_sources():
     async with lock:
         if not os.path.exists(srcdir):
@@ -135,6 +128,40 @@ async def do_pull_sources():
         return True, ""
     else:
         return False, "git command failed"
+
+
+async def do_update_odb():
+    async def request_update(compiler):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url=compiler["endpoints"]["update"]) as resp:
+                    if resp.status != 200:
+                        return False, compiler, f"Endpoint returned {resp.status}"
+                    resp = await resp.read()
+                    return True, compiler, json.loads(resp.decode("utf-8"))
+        except:
+            return False, compiler, "Failed to connect to endpoint"
+    results = await asyncio.gather(*[request_update(compiler) for compiler in config["compilers"]])
+
+    if not all(success for success, compiler, result in results):
+        return False, f"Failed to update ODB on some targets: {results[0][2]}"
+
+    if not all(result["success"] for success, compiler, result in results):
+        failed_msgs = [f"{compiler['type']}/{compiler['platform']}: {result['message']}"
+                       for success, compiler, result in results]
+        return False, "Failed to update ODB on some targets:\n" + "\n".join(failed_msgs)
+
+    try:
+        first_odb_compiler = [c for c in config["compilers"] if c["type"] == "odb"][0]
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url=first_odb_compiler["endpoints"]["commit_hash"]) as resp:
+                if resp.status != 200:
+                    return False, f"Endpoint returned {resp.status}"
+                resp = await resp.read()
+                version = json.loads(resp.decode("utf-8"))["commit_hash"]
+                return True, f"ODB updated to {version}"
+    except:
+        return False, "Failed to connect to endpoint"
 
 
 async def post_status_to_bot(msg):
@@ -210,15 +237,13 @@ async def do_run_all():
         compiler_versions = dict()
         for success, compiler, version_or_error in version_results:
             if not success:
-                await post_status_to_bot(version_or_error)
-                return False
+                return False, version_or_error
             compiler_versions.setdefault(compiler["type"], dict())[compiler["platform"]] = version_or_error
 
         # Make sure all ODB compilers have the same version
         if not all_equal(version for plat, version in compiler_versions["odb"].items()):
             versions = [f"odb/{plat}: {version}" for plat, version in compiler_versions["odb"].items()]
-            await post_status_to_bot("CI aborted because not all ODB compilers are on the same version\n" + "\n".join(versions))
-            return False
+            return False, "CI aborted because not all ODB compilers are on the same version\n" + "\n".join(versions)
 
         # Compile the code on all available compilers
         async def do_compile(compiler, filename):
@@ -259,8 +284,7 @@ async def do_run_all():
         d = dict()
         for success, compiler, filename, response in compile_results:
             if not success:
-                await post_status_to_bot(response)
-                return False
+                return False, response
             d.setdefault(filename, dict()).setdefault(compiler["type"], dict()).setdefault(compiler["platform"], {
                 "success": response["success"],
                 "output": response["output"]
@@ -488,7 +512,19 @@ async def github_event_ci_sources_pushed():
     if not data["ref"].rsplit("/", 1)[-1] == "master":
         return ""
 
-    await post_status_to_bot("CI run started")
+    async def pull_and_run_all():
+        await post_status_to_bot("[CI] Updating sources...")
+        success, msg = await do_pull_sources()
+        if not success:
+            return await post_status_to_bot(msg)
+
+        await post_status_to_bot("[CI] Run started...")
+        success, msg = await do_run_all()
+        if not success:
+            return await post_status_to_bot(msg)
+
+        await do_status()
+
     asyncio.ensure_future(pull_and_run_all())
     return ""
 
@@ -503,11 +539,26 @@ async def github_event_odb_pushed():
     if not event_type == "push":
         return ""
 
-    # only care about pushes to master branch
+    # only care about pushes to master and devel branch
     data = json.loads(payload.decode("utf-8"))
     ref = data["ref"].rsplit("/", 1)[-1]
     if ref not in ("master", "devel"):
         return ""
+
+    async def update_odb_and_run_all():
+        await post_status_to_bot("[CI] Updating ODB on all targets...")
+        success, msg = await do_update_odb()
+        if not success:
+            return await post_status_to_bot(msg)
+
+        await post_status_to_bot("[CI] Run started...")
+        success, msg = await do_run_all()
+        if not success:
+            return await post_status_to_bot(msg)
+
+        await do_status()
+
+    asyncio.ensure_future(update_odb_and_run_all())
 
     return ""
 
@@ -521,44 +572,10 @@ async def pull_sources():
 
 @app.route("/update_odb")
 async def update_odb():
-    await post_status_to_bot("Updating ODB on all targets...")
-
-    async def request_update(compiler):
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url=compiler["endpoints"]["update"]) as resp:
-                    if resp.status != 200:
-                        return False, compiler, f"Endpoint returned {resp.status}"
-                    resp = await resp.read()
-                    return True, compiler, json.loads(resp.decode("utf-8"))
-        except:
-            return False, compiler, "Failed to connect to endpoint"
-    results = await asyncio.gather(*[request_update(compiler) for compiler in config["compilers"]])
-
-    if not all(success for success, compiler, result in results):
-        await post_status_to_bot(f"Failed to update ODB on some targets: {results[0][2]}")
-        return ""
-
-    if not all(result["success"] for success, compiler, result in results):
-        failed_msgs = [f"{compiler['type']}/{compiler['platform']}: {result['message']}"
-                       for success, compiler, result in results]
-        await post_status_to_bot("Failed to update ODB on some targets:\n" + "\n".join(failed_msgs))
-        return ""
-
-    try:
-        first_odb_compiler = [c for c in config["compilers"] if c["type"] == "odb"][0]
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url=first_odb_compiler["endpoints"]["commit_hash"]) as resp:
-                if resp.status != 200:
-                    await post_status_to_bot(f"Endpoint returned {resp.status}")
-                    return ""
-                resp = await resp.read()
-                version = json.loads(resp.decode("utf-8"))["commit_hash"]
-                await post_status_to_bot(f"ODB updated to {version}")
-                return ""
-    except:
-        await post_status_to_bot("Failed to connect to endpoint")
-        return ""
+    await post_status_to_bot("[CI] Updating ODB on all targets...")
+    success, msg = await do_update_odb()
+    await post_status_to_bot(msg)
+    return ""
 
 
 @app.route("/clear_cache")
@@ -566,13 +583,13 @@ async def clear_cache():
     async with lock:
         shutil.rmtree(resultsdir)
         os.mkdir(resultsdir)
-    await post_status_to_bot("Cache cleared")
+    await post_status_to_bot("[CI] Cache cleared")
     return ""
 
 
 @app.route("/run_all")
 async def run_all():
-    await post_status_to_bot("CI run started")
+    await post_status_to_bot("[CI] CI run started")
     await do_run_all()
     await do_status()
     return ""
